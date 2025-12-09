@@ -1,0 +1,403 @@
+# Directus Architecture & Bun Migration Index
+
+## 1. Context
+
+Directus is a real-time data platform that wraps any SQL database with REST, GraphQL, and a Vue-based admin app, all delivered from a pnpm-managed monorepo (`api`, `app`, `sdk`, CLI, and 30+ shared packages) with strict catalog pinning and a BSL 1.1 license model for sustainability [DeepWiki](https://deepwiki.com/directus/directus). This document captures the current code-level architecture and enumerates every area touched by the upcoming shift from a Node.js runtime to Bun.
+
+## 2. Workspace Overview
+
+- **Package management:** `pnpm@10.14.0` in catalog/strict mode (`pnpm-workspace.yaml`) keeps dependency versions uniform and enforces workspace scoping. Corepack is used in CI/Docker.
+- **Top-level packages:**  
+  - `api/` – Express/Knex API server, background schedulers, flows, extensions, websockets.  
+  - `app/` – Vue 3 + Vite admin client with dynamic extensions.  
+  - `directus/` – CLI wrapper that bootstraps the API for deployments.  
+  - `sdk/` – Type-safe composable client (REST/GraphQL/realtime).  
+  - `packages/*` – Shared libs (env parsing, errors, schema inspector, storage drivers, extensions SDK, scaffolding CLIs, etc.).  
+  - `tests/blackbox` – Deployment-level regression tests.
+- **Tooling:** TypeScript everywhere, `tsc/tsdown/tsx` for builds, `vitest` for unit tests, `vite`/`histoire` for UI, `rollup/rolldown` for bundling extensions, `pm2` for runtime process control.
+
+## 3. Backend API System (`api/`)
+
+### 3.1 Boot and Lifecycle
+
+Server startup flows through `src/start.ts` → `createServer()` → `createApp()`, composing an HTTP server, instrumentation hooks, graceful shutdown via `@godaddy/terminus`, optional WebSockets, and the Directus emitter.
+
+```35:205:api/src/server.ts
+export async function createServer(): Promise<http.Server> {
+	const server = http.createServer(await createApp());
+	Object.assign(server, getConfigFromEnv('SERVER_'));
+
+	server.on('request', function (req: http.IncomingMessage & Request, res: http.ServerResponse) {
+		const startTime = process.hrtime();
+		// request/response metrics emission happens here
+	});
+
+	if (toBoolean(env['WEBSOCKETS_ENABLED']) === true) {
+		createSubscriptionController(server);
+		startWebSocketHandlers();
+	}
+
+	const terminusOptions: TerminusOptions = {
+		timeout: (env['SERVER_SHUTDOWN_TIMEOUT'] as number) || 1000,
+		signals: ['SIGINT', 'SIGTERM', 'SIGHUP'],
+		beforeShutdown,
+		onSignal,
+		onShutdown,
+	};
+
+	createTerminus(server, terminusOptions);
+	return server;
+}
+```
+
+Lifecycle events (`server.start`, `server.stop`, webhook controllers, database teardown) propagate through `emitter.emitAction` to flows/extensions, so any runtime change must preserve those hooks.
+
+### 3.2 HTTP Pipeline & Middleware
+
+`createApp()` validates the environment, loads schema, initializes extensions/flows, then wires middleware for security, rate-limiting, caching, and every REST/GraphQL endpoint before finally registering extension endpoints and cron schedules.
+
+```81:348:api/src/app.ts
+export default async function createApp(): Promise<express.Application> {
+	await validateDatabaseConnection();
+	await validateDatabaseExtensions();
+	await registerAuthProviders();
+	const extensionManager = getExtensionManager();
+	await extensionManager.initialize();
+
+	const app = express();
+	app.disable('x-powered-by');
+	app.use(handlePressure(...));
+	app.use(helmet.contentSecurityPolicy(...));
+	app.use(createExpressLogger());
+	app.use(cors);
+	app.use(express.json({ limit: env['MAX_PAYLOAD_SIZE'] as string }));
+	app.use(cookieParser());
+	app.use(authenticate);
+	app.use(schema);
+	app.use(cache);
+
+	app.use('/auth', authRouter);
+	app.use('/graphql', graphqlRouter);
+	app.use('/items', itemsRouter);
+	// ... dozens of other controllers
+
+	app.use(extensionManager.getEndpointRouter());
+	app.use(notFoundHandler);
+	app.use(errorHandler);
+
+	await retentionSchedule();
+	await telemetrySchedule();
+	return app;
+}
+```
+
+Key middleware/routers:
+- **Authentication:** JWT/cookie extraction, policy lookups, RBAC enforcement (`middleware/authenticate.ts`, `permissions/*`).
+- **Schema enforcement:** `middleware/schema.ts` keeps request schema in sync with DB metadata.
+- **Caching:** HTTP caching plus system cache invalidation triggered via Redis/keyv bus.
+- **Rate limiting:** Global and per-IP via `rate-limiter-flexible`.
+- **Realtime:** `/websocket` controllers + `ws` server for subscriptions/log streaming.
+- **GraphQL:** `controllers/graphql.ts` builds schema from collections via `@directus/specs`.
+- **MCP endpoint:** Under `/mcp` when enabled for LLM tooling (see §3.8).
+
+### 3.3 Data Layer & Schema Introspection
+
+`src/database/index.ts` centralizes Knex configuration, DB health checks, migration validation, spatial extension warnings, and schema caching.
+
+```35:206:api/src/database/index.ts
+export function getDatabase(): Knex {
+	if (database) return database;
+
+	const {
+		client,
+		connectionString,
+		...connectionConfig
+	} = getConfigFromEnv('DB_', { omitPrefix: 'DB_EXCLUDE_TABLES' });
+
+	validateEnv(requiredEnvVarsFor(client));
+
+	const knexConfig: Knex.Config = {
+		client,
+		connection: connectionString || connectionConfig,
+		log: { warn: logger.warn, error: logger.error, debug: logger.debug },
+		pool: poolConfig,
+	};
+
+	database = knex.default(knexConfig);
+	validateDatabaseCharset(database);
+	database.on('query', ...metrics hooks...);
+	return database;
+}
+```
+
+Supporting pieces:
+- `getSchemaInspector()` from `@directus/schema` caches DB metadata.
+- `validateMigrations()` ensures `directus_migrations` table matches available migration files (including extensions).
+- `validateDatabaseExtensions()` warns when PostGIS/Spatialite is missing.
+- Helpers under `database/helpers` encapsulate dialect quirks.
+
+### 3.4 Event System, Flows & Automation
+
+The global emitter (`api/src/emitter.ts`) routes filter/action/init events, feeding the Flow Manager that orchestrates triggered, scheduled, webhook, and manual flows with cron-backed job queues, redaction, and RBAC-aware service invocations.
+
+```49:352:api/src/flows.ts
+class FlowManager {
+	private operations: Map<string, OperationHandler> = new Map();
+	private triggerHandlers: TriggerHandler[] = [];
+
+	public async initialize(): Promise<void> {
+		if (!this.isLoaded) await this.load();
+	}
+
+	private async load(): Promise<void> {
+		const flows = await flowsService.readByQuery({ filter: { status: { _eq: 'active' } }, fields: ['*', 'operations.*'] });
+		const flowTrees = flows.map((flow) => constructFlowTree(flow));
+
+		for (const flow of flowTrees) {
+			if (flow.trigger === 'event') {
+				events.forEach((event) => emitter.onAction(event, handler));
+			} else if (flow.trigger === 'schedule') {
+				scheduleSynchronizedJob(flow.id, flow.options['cron'], async () => await this.executeFlow(flow));
+			} else if (flow.trigger === 'webhook') {
+				this.webhookFlowHandlers[`${method}-${flow.id}`] = handler;
+			}
+		}
+
+		this.isLoaded = true;
+	}
+}
+```
+
+Flows rely on:
+- `services/*` for CRUD, notifications, files, auth, etc.
+- `operations/*` for custom pipeline steps.
+- `useBus()` for multi-process synchronization (Redis-backed).
+- `JobQueue` for serialized reloads to avoid race conditions.
+
+### 3.5 Extension System
+
+`ExtensionManager` (≈400+ lines) mounts local/registry/module extensions, compiles hybrid extension bundles with `rollup`/`rolldown`, injects app embeds, manages watchers via `chokidar`, schedules sandboxed operations with `isolated-vm`, and syncs installs through Redis channels (`extensions.reload`). Any runtime change must preserve:
+- File system watchers and bundling to regenerate Vue admin chunks.
+- Sandbox instantiation built around Node’s `vm`/`isolated-vm`.
+- Local emitter for extension-specific events.
+- Endpoint router for custom Express routes.
+
+### 3.6 Caching, Messaging & Redis
+
+`api/src/cache.ts` centralizes Keyv instances for request caching, system cache, schema freeze, and lock management. Automatic cache invalidation is broadcast over `useBus()` (Redis).
+
+```54:183:api/src/cache.ts
+export function getCache() {
+	if (env['CACHE_ENABLED'] === true && cache === null) {
+		validateEnv(['CACHE_NAMESPACE', 'CACHE_TTL', 'CACHE_STORE']);
+		cache = getKeyvInstance(env['CACHE_STORE'] as Store, getMilliseconds(env['CACHE_TTL']));
+		cache.on('error', (err) => logger.warn(err, `[cache] ${err}`));
+	}
+	if (systemCache === null) {
+		systemCache = getKeyvInstance(env['CACHE_STORE'] as Store, getMilliseconds(env['CACHE_SYSTEM_TTL']), '_system');
+	}
+	// schema cache + lock cache setup omitted for brevity
+	return { cache, systemCache, localSchemaCache, lockCache };
+}
+```
+
+### 3.7 WebSockets, Bus & Real-Time
+
+- `websocket/controllers` expose `/websocket`, `/logs`, `/subscriptions`.
+- `websocket/handlers` propagate CRUD events via `emitter`.
+- `useBus()` abstracts Redis pub/sub for cross-instance cache flushes, flow reloads, extension reload notifications, and job locks.
+
+### 3.8 Model Context Protocol (MCP)
+
+LLM tooling is exposed through `/mcp` when enabled. Access control, schema sanitization, tool routing, and prompt templating are handled by `DirectusMCP`.
+
+```32:394:api/src/mcp/server.ts
+export class DirectusMCP {
+	constructor(options: MCPOptions = {}) {
+		this.server = new Server({ name: 'directus-mcp', version: '0.1.0' }, { capabilities: { tools: {}, prompts: {} } });
+	}
+
+	handleRequest(req: Request, res: Response) {
+		if (!req.accountability?.user && !req.accountability?.role && req.accountability?.admin !== true) {
+			throw new ForbiddenError();
+		}
+
+		this.server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: getAllMcpTools() }));
+		this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+			const tool = findMcpTool(request.params.name);
+			const result = await tool.handler({ args, sanitizedQuery, schema: req.schema, accountability: req.accountability });
+			return this.toToolResponse(result);
+		});
+
+		const transport = new DirectusTransport(res);
+		this.server.connect(transport);
+	}
+}
+```
+
+### 3.9 Schedules, Telemetry & Metrics
+
+Cron jobs under `schedules/*` run retention cleanup, telemetry pings, TUS uploads, metrics snapshots, and project sync. Metrics are emitted via `prom-client`, loggers via `pino`, and `@directus/pressure` guards against event-loop overload.
+
+## 4. Frontend Admin App (`app/`)
+
+Vue 3 app bootstraps via `src/main.ts`, wiring Pinia, router, Unhead, global directives, and extension hooks before mounting.
+
+```3:67:app/src/main.ts
+import { createApp } from 'vue';
+import { createHead } from '@unhead/vue';
+import { createPinia } from 'pinia';
+import App from './app.vue';
+import { registerComponents } from './components/register';
+import { loadExtensions, registerExtensions } from './extensions';
+import { i18n } from './lang/';
+import { router } from './router';
+
+const app = createApp(App);
+app.use(i18n);
+app.use(createPinia());
+app.use(createHead());
+registerDirectives(app);
+registerComponents(app);
+registerViews(app);
+await loadExtensions();
+registerExtensions(app);
+app.use(router);
+app.mount('#app');
+```
+
+Highlights:
+- `components/`, `modules/`, `interfaces/`, `layouts/`, and `views/` implement every admin surface.
+- `extensions.ts` hot-loads panels/displays/layouts from the API-provided manifest.
+- `routes/` map to modules (Collections, Files, Activity, Settings, etc.).
+- `stores/` hold auth/session state; `composables/` wrap API access.
+- Tooling: `vite`, `histoire`, `vitest`, `vue-tsc`, `sass-embedded`.
+
+## 5. CLI, Distribution & Runtime Tooling
+
+- **CLI Entrypoint:** `directus/cli.js` (Node shebang) checks for updates then `import('@directus/api/cli/run.js')`, which builds the commander CLI and parses argv.
+
+```1:9:directus/cli.js
+#!/usr/bin/env node
+import { updateCheck } from '@directus/update-check';
+import { version } from './version.js';
+
+if (version) {
+	await updateCheck(version);
+}
+
+import('@directus/api/cli/run.js');
+```
+
+- **Dockerfile:** Multi-stage Node 22 image compiles the workspace, installs via pnpm (using `corepack`), builds everything, deploys `directus` package, and runs `pm2`.
+
+```3:74:Dockerfile
+ARG NODE_VERSION=22
+FROM node:${NODE_VERSION}-alpine AS builder
+RUN npm install --global corepack@latest
+RUN pnpm fetch && pnpm install --recursive --offline --frozen-lockfile
+pnpm run build && pnpm --filter directus deploy --legacy --prod dist
+FROM node:${NODE_VERSION}-alpine AS runtime
+RUN npm install --global pm2@5 corepack@latest
+CMD : && node cli.js bootstrap && pm2-runtime start ecosystem.config.cjs ;
+```
+
+- **Process manager:** `ecosystem.config.cjs` configures PM2 cluster mode, environment-driven concurrency, and log destinations.
+- **Scripts:** `api`, `app`, `sdk`, and shared packages all rely on Node-based CLIs (`tsx`, `tsc`, `vitest`, `tsdown`, `vite`).
+
+## 6. Shared Packages & SDK
+
+- `packages/env`, `packages/constants`, `packages/types`, `packages/utils`, `packages/errors` – foundational utilities used everywhere.
+- `packages/extensions`, `packages/extensions-sdk`, `packages/create-directus-extension` – developer tooling for nine extension types, bundling (rollup), scaffolding, and CLI wrappers.
+- `packages/storage` + `storage-driver-*` – storage abstractions and drivers (S3, GCS, Azure, Local, Supabase).
+- `packages/memory`, `packages/pressure`, `packages/schema` – runtime helpers (LRU caches, pressure detection, schema inspection).
+- `packages/specs` – OpenAPI source files and bundler.
+- `packages/composables`, `packages/themes`, `packages/stores` – shared front-end modules.
+- `sdk/` – TypeScript-first client with composable features (`rest`, `graphql`, `authenticate`, `realtime`), built via `tsdown`, tested via `vitest`, exported as both ESM and CJS for compatibility.
+
+## 7. Node Runtime Touchpoints
+
+Key areas tightly coupled to Node APIs, modules, or tooling:
+
+1. **Native addons:** `argon2`, `sharp`, `snappy`, `sqlite3`, `isolated-vm`, `oracledb`, `tedious`, `@aws-sdk/*` (Node HTTP handler), `pm2`, `node-machine-id`, `@keyv/redis`.
+2. **Process/system APIs:** `process.hrtime`, `process.send`, `cluster` semantics in PM2, `worker_threads` (within dependencies), `perf_hooks`, `os`, `fs/promises`, `node:module` (for `createRequire`), `node:url`.
+3. **Tooling CLIs:** `tsx`, `tsdown`, `vitest`, `vite`, `rollup`, `pnpm`, `corepack`, `histoire`, `vue-tsc`, `sass-embedded`.
+4. **File watching/build:** `chokidar`, `rolldown`, `rollup` plugin APIs expecting Node streams/buffers.
+5. **Networking:** `http`, `https`, `net`, `ws`, `@godaddy/terminus` hooking into Node servers.
+6. **Process managers:** `pm2` + `ecosystem.config.cjs`, `npm_config_workspace_concurrency`.
+7. **Docker image:** Node-based base layers, `npm install --global corepack`, Node entrypoints.
+8. **Testing harness:** `vitest` with `happy-dom`, `tests/blackbox` expecting Node CLI to run `pnpm --filter directus deploy`.
+
+## 8. Bun Migration Impact & Required Changes
+
+### 8.1 Toolchain & Package Management
+- Replace/augment `pnpm` workflows with `bun install` or keep pnpm under Bun’s Node shim; evaluate Corepack availability.
+- Ensure `tsc`, `tsdown`, `tsconfig` builds run via `bunx` or Bun’s TypeScript transpiler without losing incremental features.
+- Validate `rollup`, `rolldown`, `vite`, `vitest`, `histoire`, `vue-tsc`, `sass-embedded`, `tsx`, and `tsdown` under Bun (either native support or via `bunx node` compatibility shim). Where Bun lacks support (e.g., `tsx`), replace with Bun’s built-in TypeScript runner or `bun run --watch`.
+
+### 8.2 Runtime Server & CLI
+- `directus/cli.js` shebang and `node cli.js bootstrap` must run under Bun (update to `#!/usr/bin/env bun` or provide shim).  
+- `api/src/server.ts` and `@godaddy/terminus` rely on Node’s HTTP module semantics (raw sockets, `process.hrtime`, `process.send`). Confirm Bun’s compatibility layer or swap for Bun-native HTTP server/lifecycle handling.  
+- `pm2` cluster mode expects Node; either run `pm2 start bun -- directus` (test support) or move to Bun’s supervisor (e.g., `bun run directus start --smoke`) / adopt another process manager.  
+- Update `ecosystem.config.cjs` and bootstrap scripts to launch via Bun (or remove PM2 entirely in favor of Bun workers).  
+- Revisit WebSocket controllers to ensure `ws` works under Bun’s networking stack.
+
+### 8.3 Native Dependencies & Database Drivers
+- Confirm Bun can compile and load the following Node-API/C++ addons: `argon2`, `sharp`, `snappy`, `sqlite3`, `oracledb`, `tedious`, `isolated-vm`, `pm2`, storage drivers (S3/GCS rely on Node HTTP).  
+- Where Bun lacks N-API compatibility, alternatives are required (e.g., `argon2-browser`, WebAssembly builds, or using Bun’s built-in password hashing if available).  
+- Database clients (`knex`, `pg`, `mysql2`, `sqlite3`, `tedious`, `oracledb`) assume Node’s `net`/`tls`; verify Bun’s TCP/TLS polyfills.
+
+### 8.4 Extension Bundling & Sandbox
+- Extension bundling uses `rollup` plugins and Node streams plus `isolated-vm`. Bun currently lacks drop-in replacements for `isolated-vm`; need to evaluate Bun’s `vm` compatibility, or conditionally keep Node for extension sandboxing until Bun provides an alternative.  
+- `chokidar` file watching and `fs.promises` patterns must map to Bun watchers; consider migrating to Bun’s `watch` API or ensure `chokidar` functions under Bun.  
+- `processId()` from `@directus/utils/node` uses Node-specific logic; ensure Bun’s `process` shim provides same fields.
+
+### 8.5 Realtime & Networking
+- WebSocket stack uses `ws` + raw HTTP upgrade events; confirm `ws` supports Bun (currently experimental).  
+- `@tus/server`, `pino-http`, `prom-client` rely on Node HTTP internals. Validate under Bun or replace with Bun-native equivalents.  
+- `createServer()` manipulates `http.Server` prototypes and relies on `server instanceof https.Server`; confirm Bun’s polyfills support identical semantics.
+
+### 8.6 Caching, Messaging & Redis
+- `Keyv` with `@keyv/redis` uses `ioredis`, which depends on Node `net`, `tls`, and `dns`; ensure Bun’s compatibility covers those modules.  
+- `redis/index.ts` leverages `node:cluster` signals for locking. Evaluate Bun’s Worker/Cluster story and adapt locking primitives if necessary.
+
+### 8.7 Observability & Pressure Control
+- `@directus/pressure` monitors event-loop delay via `perf_hooks`. Bun exposes different runtime metrics; update the limiter or wrap Bun’s equivalents.  
+- `pino` and transports expect Node streams (`process.stdout`, `stream.Writable`). Bun implements WHATWG streams by default; verify compatibility or pin to Pino versions known to work on Bun.  
+- `metrics/` uses `prom-client` timers bound to Node’s `process.hrtime`.
+
+### 8.8 Containerization & Deployment
+- Migrate Dockerfile base images from `node:*-alpine` to `oven/bun` (or multi-stage Node→Bun while dependencies catch up).  
+- Rework build stage commands (`npm install --global corepack`, `pnpm fetch`, `node -e ...`) to their Bun equivalents.  
+- Ensure final runtime image installs dependencies compatible with Bun and runs `bun cli.js bootstrap` (or `bun run directus start`) instead of `node`/`pm2-runtime`.  
+- Update `docker-compose.yml` services to expose Bun-compatible healthchecks.
+
+### 8.9 Testing & QA
+- `vitest` recently added Bun support but depends on Node features (mock timers, fs watchers). Pin to versions officially supporting Bun or run tests under Node until parity is confirmed.  
+- `tests/blackbox` orchestrate deployments via `pnpm --filter directus deploy --legacy --prod dist`; need Bun-based alternative or continue using Node for packaging while runtime migrates.
+
+### 8.10 Developer Experience & Scripts
+- Replace `tsx` dev server command (`tsx watch ...`) with Bun’s native `bun --watch` or `bunx tsx` if supported.  
+- Update `package.json` scripts (root + packages) to call `bun run`/`bunx` where possible.  
+- Document environment changes (e.g., `NODE_ENV` vs `BUN_ENV`) and ensure `useEnv()` still surfaces the correct runtime metadata.  
+- Update `.nvmrc`/Engines metadata once Bun is required.
+
+### 8.11 Risk Register
+- **Isolation sandbox:** no Bun replacement for `isolated-vm` yet; may have to keep a Node microservice for extensions.  
+- **Database drivers:** OracleDB + MSSQL clients may not compile under Bun initially.  
+- **Process signals:** Bun currently lacks `process.send`, impacting PM2 “ready” signals.  
+- **Native hashing libs:** Argon2 fallback needed to avoid blocking migration.  
+- **LLM MCP stack:** `@modelcontextprotocol/sdk` depends on Node’s streaming JSON RPC; confirm Bun compatibility.
+
+## 9. Recommended Next Steps
+
+1. **Spike Bun runtime for API:** Run `bun run api/src/start.ts` with minimal dependencies to gauge compatibility (disable extensions, websockets, MCP).  
+2. **Prototype Bun Docker image:** Build a new multi-stage Dockerfile atop `oven/bun`, replacing `pm2` with Bun’s process manager or systemd supervision.  
+3. **Audit native addons:** For each native dependency, document Bun support status (supported, needs patch, or requires fallback). Prioritize `argon2`, `sharp`, `sqlite3`, `isolated-vm`.  
+4. **Replace dev scripts:** Introduce Bun-based scripts (e.g., `bun run dev:api`) and keep Node fallbacks until parity is proven.  
+5. **Extension sandbox plan:** Investigate using Bun’s `bun:jsc` sandbox or WebAssembly to replace `isolated-vm`, or keep Node-based sandboxing via a sidecar.  
+6. **Testing pipeline:** Configure CI matrix to run Vitest both on Node and Bun, logging deltas.  
+7. **Update documentation:** Once migrations are validated, document “Bun prerequisites” in `readme.md` and `docker/` instructions.
+
+Maintaining feature parity throughout the migration demands exhaustive regression coverage (REST, GraphQL, flows, MCP, extensions, websockets, storage drivers). Treat the move as a phased rollout—start with Bun in development, then CI, then optional production runtime, keeping Node-based tooling available until all critical native modules and watchers are confirmed.
+

@@ -1,0 +1,4 @@
+## MCP Prompts Interface
+
+- `system-mcp-prompts-collection-validation` inside `app/src/interfaces/_system/system-mcp-prompts-collection-validation/` is tightly coupled to the MCP feature living in the API package. Beyond rendering UI, it orchestrates schema mutations by calling admin endpoints to create collections, fields, and relations, then rehydrates Pinia stores so the frontend mirrors server metadata.
+- In `system-mcp-prompts-collection-generate-dialog.vue` the interface directly invokes the shared `api` client to scaffold the MCP prompts collection if missing, including relations to `directus_users`. This workflow extends far beyond passive HTTP/WebSocket consumption—it programmatically bootstraps server-side schema to keep the MCP subsystem consistent.
